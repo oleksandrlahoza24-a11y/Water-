@@ -485,21 +485,7 @@ canvas.addEventListener('touchend',    e => { e.preventDefault(); onUp();    }, 
 canvas.addEventListener('touchcancel', e => { e.preventDefault(); onUp();    }, { passive:false });
 
 // ─── Ambient rain drops ─────────────────────────────────────────────────────
-const drops = [];
-let lastDrop = 0;
 
-function maybeSpawnDrop(now) {
-  const gap = ptr.active ? 5000 : (500 + Math.random() * 800);
-  if (now - lastDrop < gap) return;
-  lastDrop = now;
-  drops.push({
-    x:   0.08 + Math.random() * 0.84,
-    y:   0.08 + Math.random() * 0.84,
-    str: 0.10 + Math.random() * 0.22,
-    born: now,
-    ttl:  40  + Math.random() * 40
-  });
-}
 
 // ─── Simulation step ────────────────────────────────────────────────────────
 function simulate(src, dst, mx, my, active, str) {
