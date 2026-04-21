@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Ultra-Realistic Water</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #04111a; }
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+    cursor: crosshair;
+  }
+  #hint {
+    position: fixed;
+    bottom: 32px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: rgba(160, 220, 255, 0.55);
+    font-family: 'Palatino Linotype', 'Book Antiqua', Palatino, serif;
+    font-size: 13px;
+    letter-spacing: 4px;
+    text-transform: uppercase;
+    pointer-events: none;
+    transition: opacity 2.5s ease;
+    text-shadow: 0 0 20px rgba(80,180,255,0.4);
+  }
+  #hint.fade { opacity: 0; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">∿ touch the water ∿</div>
+<script>
+'use strict';
+
+const canvas = document.getElementById('c');
+const hint   = document.getElementById('hint');
+
+// ─── WebGL init ───────────────────────────────────────────────────────────────
+const gl = canvas.getContext('webgl', { antialias: false, alpha: false, preserveDrawingBuffer: false })
+        || canvas.getContext('experimental-webgl', { antialias: false, alpha: false });
+
+if (!gl) {
+  document.body.style.cssText = 'background:#030c12;display:flex;align-items:center;justify-content:center';
+  document.body.innerHTML = '<p style="color:#7ad;font-family:serif;font-size:18px;text-align:center;line-height:2">WebGL is not supported<br><small style="opacity:.5">Try a modern browser like Chrome or Firefox</small></p>';
+  throw 0;
+}
+
+// Extensions
+const extFloat     = gl.getExtension('OES_texture_float');
+const extHalfFloat = gl.getExtension('OES_texture_half_float');
+gl.getExtension('OES_texture_float_linear');
+gl.getExtension('OES_texture_half_float_linear');
+gl.getExtension('WEBGL_color_buffer_float');
+gl.getExtension('EXT_color_buffer_half_float');
+
+// Detect best renderable float format
+function canRenderTo(type) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 4, 4, 0, gl.RGBA, type, null);
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+  gl.deleteFramebuffer(f); gl.deleteTexture(t);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return ok;
+}
+
+let FTYPE, INIT_VAL, USE_ENC = true; // always encode [−1,1]→[0,1]
+if (extFloat && canRenderTo(gl.FLOAT)) {
+  FTYPE = gl.FLOAT;
+  INIT_VAL = 'float32';
+} else if (extHalfFloat && canRenderTo(extHalfFloat.HALF_FLOAT_OES)) {
+  FTYPE = extHalfFloat.HALF_FLOAT_OES;
+  INIT_VAL = 'half16';
+} else {
+  FTYPE = gl.UNSIGNED_BYTE;
+  INIT_VAL = 'uint8';
+}
+
+// Simulation dimensions (square)
+const S = 512;
+let W = 0, H = 0;
+
+function resize() {
+  W = canvas.width  = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ─── Shader Sources ────────────────────────────────────────────────────────────
+const VERT = `
+  attribute vec2 aPos;
+  varying   vec2 vUV;
+  void main() {
+    vUV = aPos * 0.5 + 0.5;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }
+`;
+
+// Simulation shader — 2D wave equation with boundary sponge
+const SIM_FRAG = `
+  precision highp float;
+  varying vec2  vUV;
+  uniform sampler2D uState;
+  uniform vec2  uTexel;
+  uniform vec2  uMouse;
+  uniform float uRadius;
+  uniform float uStrength;
+
+  #define DEC(v) ((v)*2.0-1.0)
+  #define ENC(v) ((v)*0.5+0.5)
+
+  void main() {
+    float curr = DEC(texture2D(uState, vUV).r);
+    float prev = DEC(texture2D(uState, vUV).g);
+
+    float n = DEC(texture2D(uState, vUV + vec2( 0.0,       uTexel.y)).r);
+    float s = DEC(texture2D(uState, vUV - vec2( 0.0,       uTexel.y)).r);
+    float e = DEC(texture2D(uState, vUV + vec2( uTexel.x,  0.0     )).r);
+    float w = DEC(texture2D(uState, vUV - vec2( uTexel.x,  0.0     )).r);
+
+    // Wave equation (max-speed stable: α=0.5)
+    float next = (-prev + (n + s + e + w) * 0.5) * 0.994;
+
+    // Sponge-layer: absorb waves at canvas edges
+    float bx = min(vUV.x, 1.0-vUV.x) * 14.0;
+    float by = min(vUV.y, 1.0-vUV.y) * 14.0;
+    float sponge = clamp(min(bx, by), 0.0, 1.0);
+    next *= mix(0.80, 1.0, sponge);
+
+    // Pointer disturbance
+    float d = length(vUV - uMouse);
+    next -= smoothstep(uRadius, 0.0, d) * uStrength;
+
+    next = clamp(next, -1.0, 1.0);
+    gl_FragColor = vec4(ENC(next), ENC(curr), 0.0, 1.0);
+  }
+`;
+
+// Render shader — physically-based water appearance
+const RENDER_FRAG = `
+  precision highp float;
+  varying vec2 vUV;
+  uniform sampler2D uWater;
+  uniform vec2  uTexel;
+  uniform float uTime;
+  uniform float uAspect;
+
+  // ── Noise helpers ──────────────────────────────────────────────────────────
+  float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+  }
+  float vnoise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f*f*(3.0-2.0*f);
+    return mix(
+      mix(hash(i),           hash(i+vec2(1,0)), f.x),
+      mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), f.x), f.y);
+  }
+  float fbm(vec2 p) {
+    float v=0.0, a=0.5;
+    for (int i=0; i<5; i++) { v+=vnoise(p)*a; p*=2.1; a*=0.5; }
+    return v;
+  }
+
+  // ── Procedural sky ─────────────────────────────────────────────────────────
+  vec3 getSky(vec2 rDir) {
+    float t = clamp(rDir.y * 1.4, 0.0, 1.0);
+    vec3 zenith  = vec3(0.06, 0.28, 0.72);
+    vec3 horizon = vec3(0.52, 0.76, 0.96);
+    vec3 sky = mix(horizon, zenith, t*t);
+
+    // Sun
+    vec2 sunDir = normalize(vec2(0.35, 0.75));
+    float sd = dot(normalize(rDir), sunDir);
+    sky += vec3(1.00, 0.96, 0.78) * pow(max(sd,0.0), 120.0) * 2.5;
+    sky += vec3(1.00, 0.75, 0.40) * pow(max(sd,0.0),   6.0) * 0.35;
+
+    // Soft clouds
+    float cloud = fbm(rDir * 5.0 + 3.7) * fbm(rDir * 3.0 + 1.2);
+    sky = mix(sky, vec3(0.90, 0.93, 0.98), smoothstep(0.35, 0.65, cloud) * 0.55 * (1.0-t));
+
+    return sky;
+  }
+
+  // ── Procedural seabed ──────────────────────────────────────────────────────
+  vec3 getSeabed(vec2 uv) {
+    float drift = uTime * 0.025;
+    vec2  scrollUV = uv + vec2(drift, drift * 0.4);
+
+    // Sand ripples
+    float r1 = sin(uv.x*32.0 + fbm(uv*4.0 + drift)*5.0) * 0.5 + 0.5;
+    float r2 = sin(uv.y*26.0 + fbm(uv*3.5 + 1.7 + drift)*4.0) * 0.5 + 0.5;
+    float rip = r1 * r2;
+    float detail = fbm(uv*16.0 + drift*0.5);
+
+    vec3 sand1 = vec3(0.82, 0.71, 0.48);
+    vec3 sand2 = vec3(0.73, 0.61, 0.38);
+    vec3 base  = mix(sand2, sand1, rip * pow(detail, 0.5));
+
+    // Rocks
+    float rockF = smoothstep(0.55, 0.75, fbm(uv*3.8+2.3));
+    vec3 rock   = vec3(0.47, 0.43, 0.37) * (0.7 + 0.3*fbm(uv*9.0+4.1));
+    base = mix(base, rock, rockF * 0.7);
+
+    // Seaweed patches
+    float weed = smoothstep(0.60, 0.82, fbm(uv*8.5+5.8))
+               * smoothstep(0.50, 0.68, fbm(uv*5.0+8.3));
+    base = mix(base, vec3(0.15, 0.38, 0.18), weed * 0.60);
+
+    // Pebble scatter
+    float pebble = step(0.78, hash(floor(uv*80.0)));
+    float pebbleS= vnoise(uv*80.0)*0.2+0.5;
+    base = mix(base, vec3(pebbleS)*0.6, pebble*0.3);
+
+    return base;
+  }
+
+  // ── Height fetch (always encoded) ─────────────────────────────────────────
+  float H(vec2 uv) {
+    return texture2D(uWater, uv).r * 2.0 - 1.0;
+  }
+
+  void main() {
+    vec2 uv = vUV;
+    vec2 tx = uTexel * 1.8; // slightly wider stencil for smoother normals
+
+    float h  = H(uv);
+    float hN = H(uv + vec2(0.0,  tx.y));
+    float hS = H(uv - vec2(0.0,  tx.y));
+    float hE = H(uv + vec2(tx.x,  0.0));
+    float hW = H(uv - vec2(tx.x,  0.0));
+
+    // ── Surface normal (aspect-corrected) ─────────────────────────────────
+    float ns = 5.5;
+    vec3 normal = normalize(vec3(
+      (hW - hE) * ns / uAspect,
+      (hS - hN) * ns,
+      0.10
+    ));
+
+    vec3 V = vec3(0.0, 0.0, 1.0);   // viewer (top-down)
+    vec3 L = normalize(vec3(0.40, 0.68, 1.0)); // sun direction
+
+    // ── Fresnel (Schlick, n_water ≈ 1.333) ────────────────────────────────
+    float cosI  = max(dot(normal, V), 0.0);
+    float F0    = 0.020;  // ((1-1.333)/(1+1.333))^2
+    float fresnel = F0 + (1.0 - F0) * pow(1.0 - cosI, 5.0);
+
+    // ── Refraction (view of seabed through distorted surface) ─────────────
+    vec2 refOff = normal.xy * 0.070 * (1.0 - fresnel * 0.5);
+    vec2 refUV  = clamp(uv + refOff, 0.001, 0.999);
+    vec3 seabed = getSeabed(refUV + vec2(uTime * 0.003, 0.0));
+
+    // Water attenuation of seabed color (Beer–Lambert)
+    vec3 extinction = exp(-vec3(0.65, 0.11, 0.03) * 2.2);
+    seabed *= extinction;
+
+    // ── Caustics ──────────────────────────────────────────────────────────
+    // From surface curvature (negative Laplacian = focusing)
+    float laplacian = hN + hS + hE + hW - 4.0 * h;
+    float curvCaustic = pow(max(0.0, -laplacian * 8.5), 1.6) * 1.8;
+
+    // Animated procedural caustics (Snell-like interference pattern)
+    vec2 cUV = refUV * vec2(uAspect * 14.0, 14.0);
+    float ca = sin(cUV.x*1.8 + uTime*2.3) * sin(cUV.y*1.7 + uTime*2.0)
+             + sin(cUV.x*1.2 - uTime*1.6 + 1.1) * sin(cUV.y*1.3 - uTime*1.9 + 0.8);
+    float animCaustic = pow(max(0.0, ca * 0.25 + 0.5), 3.5) * 0.55;
+
+    seabed *= 1.0 + curvCaustic + animCaustic;
+
+    // ── Sky reflection ─────────────────────────────────────────────────────
+    vec3 R = reflect(-L, normal);
+    vec3 sky = getSky(R.xy * 0.5 + 0.5);
+
+    // ── Intrinsic water scattering color ──────────────────────────────────
+    vec3 deepColor    = vec3(0.010, 0.08, 0.21);
+    vec3 shallowColor = vec3(0.06,  0.38, 0.63);
+    vec3 waterColor   = mix(deepColor, shallowColor, clamp(0.5 + h * 1.8, 0.0, 1.0));
+
+    // ── Compose: refraction ↔ reflection via Fresnel ───────────────────────
+    vec3 col = mix(seabed, sky, clamp(fresnel * 0.92 + 0.04, 0.0, 1.0));
+
+    // Blend in water body tint
+    col = mix(col, waterColor, 0.20);
+
+    // ── Sub-surface scattering approximation (light through crests) ───────
+    float sss = smoothstep(-0.05, 0.30, h) * max(0.0, dot(normal, L));
+    col += vec3(0.00, 0.52, 0.72) * sss * 0.28;
+
+    // ── Specular highlights ────────────────────────────────────────────────
+    float RdotV = max(dot(R, V), 0.0);
+    col += vec3(1.00, 0.97, 0.88) * pow(RdotV, 420.0) * 5.5;   // tight sun glint
+    col += vec3(0.80, 0.90, 1.00) * pow(RdotV,  55.0) * 0.28;  // wide shimmer halo
+
+    // ── Foam at wave crests ────────────────────────────────────────────────
+    float crest    = smoothstep(0.16, 0.38, h);
+    float foamNoise= pow(fbm(uv * 24.0 + uTime * 0.9), 1.5);
+    float foam     = crest * foamNoise;
+    col = mix(col, vec3(0.94, 0.97, 1.00), foam * 0.88);
+
+    // Thin trailing foam / wake
+    float wake = smoothstep(0.06, 0.18, abs(h)) * fbm(uv*18.0+uTime*0.4) * 0.18;
+    col += vec3(0.70, 0.85, 1.00) * wake;
+
+    // ── Atmospheric depth haze (distant horizon slightly brighter/bluer) ──
+    float fog = pow(clamp(1.0 - vUV.y * 1.6, 0.0, 1.0), 4.0) * 0.25;
+    col = mix(col, vec3(0.28, 0.55, 0.82), fog);
+
+    // ── Vignette ──────────────────────────────────────────────────────────
+    vec2 vd = (vUV * 2.0 - 1.0) * vec2(uAspect, 1.0);
+    float vig = 1.0 - dot(vd, vd) * 0.062;
+    col *= clamp(vig, 0.0, 1.0);
+
+    // ── Tone-map + gamma ───────────────────────────────────────────────────
+    // Filmic Reinhard
+    col = col * (1.0 + col * 0.14) / (col + 0.9) * 1.08;
+    col = pow(max(col, vec3(0.0)), vec3(1.0 / 2.2));
+
+    gl_FragColor = vec4(col, 1.0);
+  }
+`;
+
+// ─── GL Helpers ───────────────────────────────────────────────────────────────
+function mkShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error('Shader: ' + gl.getShaderInfoLog(s));
+  return s;
+}
+
+function mkProg(fsrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, mkShader(gl.VERTEX_SHADER, VERT));
+  gl.attachShader(p, mkShader(gl.FRAGMENT_SHADER, fsrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    throw new Error('Program: ' + gl.getProgramInfoLog(p));
+  const u = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) {
+    const info = gl.getActiveUniform(p, i);
+    u[info.name] = gl.getUniformLocation(p, info.name);
+  }
+  return { p, u };
+}
+
+let simProg, renderProg;
+try {
+  simProg    = mkProg(SIM_FRAG);
+  renderProg = mkProg(RENDER_FRAG);
+} catch (e) {
+  console.error(e);
+  document.body.innerHTML = `<pre style="color:#f88;padding:20px;font-size:12px">${e.message}</pre>`;
+  throw e;
+}
+
+// Full-screen quad
+const qbuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, qbuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+
+function bindQuad(prog) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, qbuf);
+  const loc = gl.getAttribLocation(prog.p, 'aPos');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+}
+
+// ─── Framebuffers ─────────────────────────────────────────────────────────────
+function initData() {
+  // All values = 0.5 → decoded: 0 (resting water surface)
+  if (INIT_VAL === 'float32') {
+    return new Float32Array(S * S * 4).fill(0.5);
+  } else if (INIT_VAL === 'uint8') {
+    return new Uint8Array(S * S * 4).fill(128);
+  } else {
+    // Half-float: 0.5 = 0x3800
+    return new Uint16Array(S * S * 4).fill(0x3800);
+  }
+}
+
+function mkFBO() {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, S, S, 0, gl.RGBA, FTYPE, initData());
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { tex, fbo };
+}
+
+let fboA = mkFBO();
+let fboB = mkFBO();
+
+// ─── Input ────────────────────────────────────────────────────────────────────
+const ptr = { x: 0.5, y: 0.5, active: false, prevX: 0.5, prevY: 0.5 };
+let hintDismissed = false;
+
+function toUV(cx, cy) {
+  return { x: cx / W, y: 1.0 - cy / H };
+}
+function onDown(e) {
+  const t = e.touches ? e.touches[0] : e;
+  const uv = toUV(t.clientX, t.clientY);
+  Object.assign(ptr, uv, { active: true, prevX: uv.x, prevY: uv.y });
+  if (!hintDismissed) {
+    hintDismissed = true;
+    hint.classList.add('fade');
+    setTimeout(() => hint.style.display = 'none', 3000);
+  }
+}
+function onMove(e) {
+  if (!ptr.active) return;
+  const t = e.touches ? e.touches[0] : e;
+  ptr.prevX = ptr.x; ptr.prevY = ptr.y;
+  Object.assign(ptr, toUV(t.clientX, t.clientY));
+}
+function onUp() { ptr.active = false; }
+
+canvas.addEventListener('mousedown', onDown);
+canvas.addEventListener('mousemove', onMove);
+window.addEventListener('mouseup', onUp);
+canvas.addEventListener('touchstart', onDown, { passive: true });
+canvas.addEventListener('touchmove', e => { e.preventDefault(); onMove(e); }, { passive: false });
+canvas.addEventListener('touchend', onUp);
+
+// ─── Ambient rain drops ───────────────────────────────────────────────────────
+const drops = [];
+let lastDrop = 0;
+
+function maybeSpawnDrop(now) {
+  const gap = ptr.active ? 3000 : (600 + Math.random() * 900);
+  if (now - lastDrop < gap) return;
+  lastDrop = now;
+  drops.push({
+    x: 0.08 + Math.random() * 0.84,
+    y: 0.08 + Math.random() * 0.84,
+    str: 0.10 + Math.random() * 0.22,
+    born: now,
+    ttl: 50 + Math.random() * 40
+  });
+}
+
+// ─── Simulation step ──────────────────────────────────────────────────────────
+function simulate(src, dst, mx, my, active, str) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo);
+  gl.viewport(0, 0, S, S);
+  gl.useProgram(simProg.p);
+  bindQuad(simProg);
+
+  const u = simProg.u;
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, src.tex);
+  gl.uniform1i(u.uState,    0);
+  gl.uniform2f(u.uTexel,    1.0/S, 1.0/S);
+  gl.uniform2f(u.uMouse,    mx, my);
+  gl.uniform1f(u.uRadius,   0.046);
+  gl.uniform1f(u.uStrength, active ? str : 0.0);
+
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+// ─── Render ───────────────────────────────────────────────────────────────────
+let time = 0;
+
+function render(src) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, W, H);
+  gl.useProgram(renderProg.p);
+  bindQuad(renderProg);
+
+  const u = renderProg.u;
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, src.tex);
+  gl.uniform1i(u.uWater,   0);
+  gl.uniform2f(u.uTexel,   1.0/S, 1.0/S);
+  gl.uniform1f(u.uTime,    time);
+  gl.uniform1f(u.uAspect,  W / H);
+
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+// ─── Main loop ────────────────────────────────────────────────────────────────
+function frame(now) {
+  requestAnimationFrame(frame);
+  time = now * 0.001;
+
+  maybeSpawnDrop(now);
+
+  // Determine disturbance source
+  let mx = ptr.x, my = ptr.y, mactive = ptr.active, mstr = 0.18;
+
+  if (!mactive && drops.length > 0) {
+    const d = drops[0];
+    if (now - d.born < d.ttl) {
+      mx = d.x; my = d.y; mactive = true; mstr = d.str;
+    } else {
+      drops.shift();
+    }
+  }
+
+  // Velocity-based strength (drag faster → stronger waves)
+  if (ptr.active) {
+    const spd = Math.hypot(ptr.x - ptr.prevX, ptr.y - ptr.prevY);
+    mstr = Math.min(0.12 + spd * 18.0, 0.55);
+  }
+
+  // Multiple physics substeps per frame (accuracy + wave speed)
+  const STEPS = 4;
+  for (let i = 0; i < STEPS; i++) {
+    simulate(fboA, fboB, mx, my, mactive && i < 2, mstr);
+    const tmp = fboA; fboA = fboB; fboB = tmp;
+  }
+
+  render(fboA);
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
